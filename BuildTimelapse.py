@@ -1,14 +1,13 @@
 import ee
 from ee import batch
 import sys
+import datetime
 
-# Configure project ID
-ProjectID = "buildtimelapse"
+# Configuration
+PROJECT_ID = "buildtimelapse"
+ee.Initialize(project=PROJECT_ID)
 
-# Initialize Earth Engine
-ee.Initialize(project=ProjectID)
-
-# Define supported regions with WRS path/row and bounding box coordinates
+# Supported regions
 REGIONS = {
     "dubai": {
         "path": 160,
@@ -52,8 +51,7 @@ REGIONS = {
     }
 }
 
-# Parse command line arguments
-# Usage: python BuildTimelapse.py region [start_date end_date]
+# Argument Parsing
 if len(sys.argv) == 4:
     region_key = sys.argv[1].lower()
     start_date = sys.argv[2]
@@ -63,79 +61,117 @@ elif len(sys.argv) == 2:
     start_date = None
     end_date = None
 else:
-    print("Usage: python BuildTimelapse.py region [start_date end_date]")
-    print("Date format: YYYY-MM-DD (e.g., 2015-01-01 2017-12-31)")
-    print("Currently supported regions:", list(REGIONS.keys()))
+    print("Usage: python BuildTimelapse_Analysis.py region [start_date end_date]")
     sys.exit(1)
 
-# Check for valid region
 if region_key not in REGIONS:
     print(f"Unknown region: {region_key}")
-    print("Currently supported regions:", list(REGIONS.keys()))
     sys.exit(1)
 
 region_info = REGIONS[region_key]
+geometry = ee.Geometry.Polygon(region_info["region"])
 
-# Filter collection based on region and optional date
-collection = ee.ImageCollection('LANDSAT/LC08/C02/T1_TOA') \
-    .filter(ee.Filter.eq('WRS_PATH', region_info["path"])) \
-    .filter(ee.Filter.eq('WRS_ROW', region_info["row"])) \
-    .filter(ee.Filter.lt('CLOUD_COVER', 5)) \
-    .select(['B4', 'B3', 'B2'])
+# Image Collection
+collection = (
+    ee.ImageCollection("LANDSAT/LC08/C02/T1_TOA")
+    .filter(ee.Filter.eq("WRS_PATH", region_info["path"]))
+    .filter(ee.Filter.eq("WRS_ROW", region_info["row"]))
+    .filter(ee.Filter.lt("CLOUD_COVER", 5))
+    .select(["B2", "B3", "B4", "B5", "B6"])
+)
 
 if start_date and end_date:
-    print(f"Generating timelapse for {region_key} from {start_date} to {end_date}")
     collection = collection.filterDate(start_date, end_date)
-else:
-    print(f"Generating timelapse for {region_key} over all available dates")
 
-# Convert images to 8-bit
-def convertBit(image):
-    return image.multiply(512).uint8()  
+print("Number of images:", collection.size().getInfo())
 
-# Given a bounding box, compute dimensions that preserve aspect ratio.
-# Returns a string suitable for use in the 'dimensions' parameter.
-def compute_dimensions(region_coords, long_side_pixels=720):
-    # Get width and height in degrees
-    lon_min = min(p[0] for p in region_coords)
-    lon_max = max(p[0] for p in region_coords)
-    lat_min = min(p[1] for p in region_coords)
-    lat_max = max(p[1] for p in region_coords)
+# Spectral Indices
+def add_indices(image):
+    ndvi = image.normalizedDifference(["B5", "B4"]).rename("NDVI")
+    ndwi = image.normalizedDifference(["B3", "B5"]).rename("NDWI")
+    ndbi = image.normalizedDifference(["B6", "B5"]).rename("NDBI")
 
-    width = lon_max - lon_min
-    height = lat_max - lat_min
+    return (
+        image
+        .addBands([ndvi, ndwi, ndbi])
+        .set("date", image.date().format("YYYY-MM-dd"))
+    )
 
-    if width >= height:
-        new_width = long_side_pixels
-        new_height = int(round((height / width) * long_side_pixels))
-    else:
-        new_height = long_side_pixels
-        new_width = int(round((width / height) * long_side_pixels))
+indexed_collection = collection.map(add_indices)
 
-    return f"{new_width}x{new_height}"
+# Area Based Summaries
+def area_stats(image):
+    pixel_area = ee.Image.pixelArea()
 
+    vegetation = image.select("NDVI").gt(0.4)
+    urban = image.select("NDBI").gt(0.2)
+    water = image.select("NDWI").gt(0.3)
 
+    veg_area = vegetation.multiply(pixel_area).reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=geometry,
+        scale=30,
+        maxPixels=1e13
+    ).get("NDVI")
 
-outputVideo = collection.map(convertBit)
+    urban_area = urban.multiply(pixel_area).reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=geometry,
+        scale=30,
+        maxPixels=1e13
+    ).get("NDBI")
 
-image_count = collection.size().getInfo()
-print(f"Number of images found: {image_count}")
+    water_area = water.multiply(pixel_area).reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=geometry,
+        scale=30,
+        maxPixels=1e13
+    ).get("NDWI")
 
-if image_count == 0:
-    print("No images found. Check cloud cover, path/row, or date range.")
-    sys.exit(1)
+    mean_ndvi = image.select("NDVI").reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=geometry,
+        scale=30,
+        maxPixels=1e13
+    ).get("NDVI")
 
+    return ee.Feature(None, {
+        "date": image.get("date"),
+        "mean_ndvi": mean_ndvi,
+        "vegetation_area_m2": veg_area,
+        "urban_area_m2": urban_area,
+        "water_area_m2": water_area
+    })
 
-# Export to Google Drive as a video
-out = batch.Export.video.toDrive(
-    outputVideo,
-    description=f'{region_key}_video_timelapse',
-    #dimensions=720,
-    dimensions=compute_dimensions(region_info["region"]), # Use compute_dimensions helper function
-    framesPerSecond=2,
+time_series = indexed_collection.map(area_stats)
+feature_collection = ee.FeatureCollection(time_series)
+
+# Export CSV
+
+csv_task = batch.Export.table.toDrive(
+    collection=feature_collection,
+    description=f"{region_key}_surface_change_metrics",
+    fileFormat="CSV"
+)
+
+batch.Task.start(csv_task)
+
+# Video Export
+
+def convert_rgb(image):
+    return image.select(["B4", "B3", "B2"]).multiply(512).uint8()
+
+video_collection = indexed_collection.map(convert_rgb)
+
+video_task = batch.Export.video.toDrive(
+    collection=video_collection,
+    description=f"{region_key}_timelapse_video",
     region=region_info["region"],
+    dimensions=720,
+    framesPerSecond=2,
     maxFrames=10000
 )
 
-batch.Task.start(out)
-print("Process sent to cloud")
+batch.Task.start(video_task)
+
+print("Exports started: CSV metrics + video")
